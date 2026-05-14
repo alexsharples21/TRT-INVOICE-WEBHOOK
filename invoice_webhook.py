@@ -251,18 +251,16 @@ def extract_and_generate():
         inv_num   = data.get('invoice_number','TBC')
         filename  = f"TRT_Invoice_{inv_num}_{reg_clean}.pdf"
 
-        # Also save with reg-only name so it always overwrites previous version
-        filename_reg = f"TRT_{reg_clean}.pdf"
-
-        # Save to OneDrive - reg-only filename overwrites previous
-        onedrive_result = save_to_onedrive(pdf_bytes, filename_reg, reg_clean)
+        # Save to OneDrive
+        onedrive_result = save_to_onedrive(pdf_bytes, filename, reg_clean)
 
         return jsonify({
             'figures':      figures,
             'pdf_base64':   base64.b64encode(pdf_bytes).decode('utf-8'),
-            'filename':     filename_reg,
+            'filename':     filename,
             'onedrive':     onedrive_result,
             'success':      True
+        })
         })
     except Exception as e:
         return jsonify({'error': str(e), 'figures': figures, 'success': False}), 500
