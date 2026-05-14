@@ -244,8 +244,7 @@ def extract_and_generate():
     }
 
     invoice_data = {**data, **figures}
-
-    try:
+try:
         pdf_bytes = generate_invoice(invoice_data)
         reg_clean = data.get('reg','').replace(' ','')
         inv_num   = data.get('invoice_number','TBC')
@@ -261,10 +260,9 @@ def extract_and_generate():
             'onedrive':     onedrive_result,
             'success':      True
         })
-        })
     except Exception as e:
         return jsonify({'error': str(e), 'figures': figures, 'success': False}), 500
-
+  
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
