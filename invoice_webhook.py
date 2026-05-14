@@ -64,6 +64,47 @@ def save_to_onedrive(pdf_bytes, filename, reg=''):
         }
     return {'success': False, 'error': r.text, 'status': r.status_code}
 
+def save_to_outlook_draft(pdf_bytes, reg, filename):
+    """Create a draft email in Outlook with the PDF attached. Subject = reg."""
+    token = get_access_token()
+    if not token:
+        return {'success': False, 'error': 'Could not get access token'}
+
+    auth_header = {'Authorization': f'Bearer {token}'}
+
+    # Delete any existing draft with this reg as subject (avoid duplicates on re-runs)
+    list_url = (
+        f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}"
+        f"/mailFolders/drafts/messages?$filter=subject eq '{reg}'&$select=id"
+    )
+    r = requests.get(list_url, headers=auth_header)
+    if r.status_code == 200:
+        for msg in r.json().get('value', []):
+            del_url = f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}/messages/{msg['id']}"
+            requests.delete(del_url, headers=auth_header)
+
+    # Create the new draft with PDF attached
+    pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
+    draft = {
+        'subject': reg,
+        'body': {'contentType': 'Text', 'content': ''},
+        'attachments': [{
+            '@odata.type': '#microsoft.graph.fileAttachment',
+            'name': filename,
+            'contentType': 'application/pdf',
+            'contentBytes': pdf_b64
+        }]
+    }
+
+    headers = {**auth_header, 'Content-Type': 'application/json'}
+    create_url = f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}/messages"
+    r = requests.post(create_url, headers=headers, json=draft)
+    if r.status_code in [200, 201]:
+        item = r.json()
+        return {'success': True, 'message_id': item.get('id', ''), 'web_link': item.get('webLink', '')}
+    return {'success': False, 'error': r.text, 'status': r.status_code}
+
+
 def fmt(n):
     try:
         return f"\u00a3{float(n):,.2f}"
@@ -252,12 +293,14 @@ def extract_and_generate():
         filename = f"TRT_Invoice_{inv_num}_{reg_clean}.pdf"
 
         onedrive_result = save_to_onedrive(pdf_bytes, filename, reg_clean)
+        outlook_result = save_to_outlook_draft(pdf_bytes, reg_clean, filename)
 
         return jsonify({
             'figures': figures,
             'pdf_base64': base64.b64encode(pdf_bytes).decode('utf-8'),
             'filename': filename,
             'onedrive': onedrive_result,
+            'outlook': outlook_result,
             'success': True
         })
     except Exception as e:
