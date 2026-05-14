@@ -239,28 +239,28 @@ def extract_and_generate():
     pdf_base64 = data.get('pdf_base64', '')
 
     figures = extract_pdf_figures(pdf_base64) if pdf_base64 else {
-        'labour':'0.00','parts':'0.00','paint':'0.00',
-        'specialist':'0.00','sub_total':'0.00','vat':'0.00','grand_total':'0.00'
+        'labour': '0.00', 'parts': '0.00', 'paint': '0.00',
+        'specialist': '0.00', 'sub_total': '0.00', 'vat': '0.00', 'grand_total': '0.00'
     }
 
     invoice_data = {**data, **figures}
-try:
-        pdf_bytes = generate_invoice(invoice_data)
-        reg_clean = data.get('reg','').replace(' ','')
-        inv_num   = data.get('invoice_number','TBC')
-        filename  = f"TRT_Invoice_{inv_num}_{reg_clean}.pdf"
 
-        # Save to OneDrive
+    try:
+        pdf_bytes = generate_invoice(invoice_data)
+        reg_clean = data.get('reg', '').replace(' ', '')
+        inv_num = data.get('invoice_number', 'TBC')
+        filename = f"TRT_Invoice_{inv_num}_{reg_clean}.pdf"
+
         onedrive_result = save_to_onedrive(pdf_bytes, filename, reg_clean)
 
         return jsonify({
-            'figures':      figures,
-            'pdf_base64':   base64.b64encode(pdf_bytes).decode('utf-8'),
-            'filename':     filename,
-            'onedrive':     onedrive_result,
-            'success':      True
+            'figures': figures,
+            'pdf_base64': base64.b64encode(pdf_bytes).decode('utf-8'),
+            'filename': filename,
+            'onedrive': onedrive_result,
+            'success': True
         })
-except Exception as e:
+    except Exception as e:
         return jsonify({'error': str(e), 'figures': figures, 'success': False}), 500
     
   
