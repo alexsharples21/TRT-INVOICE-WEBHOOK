@@ -33,17 +33,28 @@ def get_access_token():
     r = requests.post(url, data=data)
     return r.json().get('access_token', '')
 
-def save_to_onedrive(pdf_bytes, filename):
+def save_to_onedrive(pdf_bytes, filename, reg=''):
     token = get_access_token()
     if not token:
         return {'success': False, 'error': 'Could not get access token'}
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/pdf'
-    }
-    # Upload to OneDrive — creates file if not exists, overwrites if it does
+
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    # Delete any existing invoice for this reg (catches TBC and old numbers)
+    if reg:
+        search_url = f'https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}/drive/root:/{ONEDRIVE_FOLDER}:/children'
+        r = requests.get(search_url, headers=headers)
+        if r.status_code == 200:
+            files = r.json().get('value', [])
+            for f in files:
+                if reg.replace(' ', '') in f['name'] and f['name'] != filename:
+                    delete_url = f'https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}/drive/items/{f["id"]}'
+                    requests.delete(delete_url, headers={'Authorization': f'Bearer {token}'})
+
+    # Upload new invoice
+    upload_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/pdf'}
     url = f'https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}/drive/root:/{ONEDRIVE_FOLDER}/{filename}:/content'
-    r = requests.put(url, headers=headers, data=pdf_bytes)
+    r = requests.put(url, headers=upload_headers, data=pdf_bytes)
     if r.status_code in [200, 201]:
         item = r.json()
         return {
@@ -240,13 +251,16 @@ def extract_and_generate():
         inv_num   = data.get('invoice_number','TBC')
         filename  = f"TRT_Invoice_{inv_num}_{reg_clean}.pdf"
 
-        # Save to OneDrive
-        onedrive_result = save_to_onedrive(pdf_bytes, filename)
+        # Also save with reg-only name so it always overwrites previous version
+        filename_reg = f"TRT_{reg_clean}.pdf"
+
+        # Save to OneDrive - reg-only filename overwrites previous
+        onedrive_result = save_to_onedrive(pdf_bytes, filename_reg, reg_clean)
 
         return jsonify({
             'figures':      figures,
             'pdf_base64':   base64.b64encode(pdf_bytes).decode('utf-8'),
-            'filename':     filename,
+            'filename':     filename_reg,
             'onedrive':     onedrive_result,
             'success':      True
         })
