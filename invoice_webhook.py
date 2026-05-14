@@ -9,6 +9,7 @@ import io
 import os
 import re
 import requests
+import pdfplumber
 
 app = Flask(__name__)
 
@@ -61,9 +62,15 @@ def fmt(n):
 def extract_pdf_figures(pdf_base64):
     try:
         pdf_bytes = base64.b64decode(pdf_base64)
-        text = pdf_bytes.decode('latin-1', errors='ignore')
-    except:
         text = ''
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text += (page.extract_text() or '') + '\n'
+    except Exception as e:
+        print(f'PDF extraction error: {e}')
+        text = ''
+
+    print(f'PDF TEXT EXTRACTED: {text[:500]}')
 
     def extract_amount(pattern):
         m = re.search(pattern, text, re.IGNORECASE)
@@ -71,11 +78,11 @@ def extract_pdf_figures(pdf_base64):
             return m.group(1).replace(',', '')
         return '0.00'
 
-    labour     = extract_amount(r'Labour\s+\xa3([\d,]+\.\d{2})')
-    parts      = extract_amount(r'Parts\s+\xa3([\d,]+\.\d{2})')
-    paint      = extract_amount(r'Paints?\s*(?:&|and)\s*Materials\s+\xa3([\d,]+\.\d{2})')
-    specialist = extract_amount(r'Specialist\s+\xa3([\d,]+\.\d{2})')
-    grand      = extract_amount(r'Repairs Grand Total\s+\xa3([\d,]+\.\d{2})')
+    labour     = extract_amount(r'Labour\s+[£$]?([\d,]+\.\d{2})')
+    parts      = extract_amount(r'Parts\s+[£$]?([\d,]+\.\d{2})')
+    paint      = extract_amount(r'Paints?\s*(?:&|and)\s*Materials\s+[£$]?([\d,]+\.\d{2})')
+    specialist = extract_amount(r'Specialist\s+[£$]?([\d,]+\.\d{2})')
+    grand      = extract_amount(r'(?:Repairs\s+)?Grand\s+Total\s+[£$]?([\d,]+\.\d{2})')
     not_vat    = bool(re.search(r'Not VAT registered', text, re.IGNORECASE))
 
     sub   = float(labour) + float(parts) + float(paint) + float(specialist)
@@ -83,14 +90,15 @@ def extract_pdf_figures(pdf_base64):
     vat   = total - sub if not not_vat and total > sub else 0.0
 
     return {
-        'labour':    f'{float(labour):.2f}',
-        'parts':     f'{float(parts):.2f}',
-        'paint':     f'{float(paint):.2f}',
-        'specialist':f'{float(specialist):.2f}',
-        'sub_total': f'{sub:.2f}',
-        'vat':       f'{vat:.2f}',
+        'labour':     f'{float(labour):.2f}',
+        'parts':      f'{float(parts):.2f}',
+        'paint':      f'{float(paint):.2f}',
+        'specialist': f'{float(specialist):.2f}',
+        'sub_total':  f'{sub:.2f}',
+        'vat':        f'{vat:.2f}',
         'grand_total':f'{total:.2f}',
-        'vat_registered': not not_vat
+        'vat_registered': not not_vat,
+        'raw_text':   text[:300]
     }
 
 def generate_invoice(data):
