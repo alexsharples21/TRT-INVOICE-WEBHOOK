@@ -260,8 +260,9 @@ try:
             'onedrive':     onedrive_result,
             'success':      True
         })
-    except Exception as e:
+except Exception as e:
         return jsonify({'error': str(e), 'figures': figures, 'success': False}), 500
+    
   
 
 if __name__ == '__main__':
