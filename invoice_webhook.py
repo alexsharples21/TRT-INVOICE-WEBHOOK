@@ -22,6 +22,43 @@ CLIENT_SECRET = os.environ.get('CLIENT_SECRET', '')
 ONEDRIVE_USER = os.environ.get('ONEDRIVE_USER', 'gary@trtmotorsltd.co.uk')
 ONEDRIVE_FOLDER = os.environ.get('ONEDRIVE_FOLDER', 'TRT Invoices')
 
+# Supabase config — set these as environment variables on Railway
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
+
+
+def supabase_request(method, path, **kwargs):
+    """Helper for Supabase REST API calls."""
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    headers = {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
+    }
+    extra = kwargs.pop('headers', {}) or {}
+    headers.update(extra)
+    return requests.request(method, url, headers=headers, **kwargs)
+
+
+def get_next_invoice_number():
+    """Call the Supabase RPC get_next_invoice_number() — an atomic Postgres sequence call.
+    Returns the next 5-digit zero-padded invoice number, or None on failure."""
+    try:
+        r = supabase_request('POST', 'rpc/get_next_invoice_number')
+        if r.status_code == 200:
+            # RPC returns the bare string value
+            result = r.json()
+            if isinstance(result, str):
+                return result
+            return str(result)
+        print(f'Sequence RPC returned {r.status_code}: {r.text}')
+    except Exception as e:
+        print(f'Sequence RPC call failed: {e}')
+    return None
+
+
+
 def get_access_token():
     url = f'https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token'
     data = {
@@ -307,6 +344,211 @@ def extract_and_generate():
         return jsonify({'error': str(e), 'figures': figures, 'success': False}), 500
     
   
+
+
+MANUAL_INVOICE_FORM = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>TRT Motors - Manual Invoice</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; max-width: 760px; margin: 30px auto; padding: 20px; background: #f5f5f7; color: #333; }
+h1 { color: #1a1aff; margin-bottom: 4px; }
+.subtitle { color: #888; margin-top: 0; font-size: 14px; }
+form { background: white; padding: 28px; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
+label { display: block; margin: 14px 0 4px; font-weight: 600; font-size: 14px; }
+input[type=text], input[type=date], input[type=number], textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 15px; box-sizing: border-box; font-family: inherit; }
+textarea { resize: vertical; min-height: 60px; }
+.row { display: flex; gap: 14px; }
+.row > div { flex: 1; }
+.amounts { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 8px; }
+.checkbox-row { display: flex; align-items: center; margin: 18px 0; }
+.checkbox-row input { margin-right: 8px; transform: scale(1.2); }
+button { background: #1a1aff; color: white; border: none; padding: 14px 28px; font-size: 16px; border-radius: 6px; cursor: pointer; margin-top: 20px; width: 100%; font-weight: 600; }
+button:hover { background: #0000d4; }
+.section-title { margin-top: 22px; padding-bottom: 6px; border-bottom: 2px solid #eee; color: #555; text-transform: uppercase; font-size: 12px; letter-spacing: 1px; }
+input[name=reg] { text-transform: uppercase; }
+.hint { color: #888; font-size: 13px; font-weight: normal; margin-left: 6px; }
+</style>
+</head>
+<body>
+<h1>TRT Motors Manual Invoice</h1>
+<p class="subtitle">Creates a new job in the database (gets next invoice number), generates the PDF, saves to OneDrive, creates a draft email.</p>
+<form method="POST">
+  <div class="section-title">Customer</div>
+  <label>Customer Name</label>
+  <input type="text" name="name" required>
+  <label>Address <span class="hint">comma separated, e.g. 123 Main St, Liverpool, L1 1AA</span></label>
+  <textarea name="address" required></textarea>
+  <label>Mobile <span class="hint">optional</span></label>
+  <input type="text" name="mobile">
+
+  <div class="section-title">Vehicle</div>
+  <div class="row">
+    <div>
+      <label>Registration</label>
+      <input type="text" name="reg" required>
+    </div>
+    <div>
+      <label>Vehicle (Make / Model)</label>
+      <input type="text" name="vehicle" required>
+    </div>
+  </div>
+  <label>Damage <span class="hint">optional</span></label>
+  <textarea name="damage"></textarea>
+
+  <div class="section-title">Job</div>
+  <div class="row">
+    <div>
+      <label>ACG Ref <span class="hint">optional</span></label>
+      <input type="text" name="acg_ref">
+    </div>
+    <div>
+      <label>Laird Ref <span class="hint">optional</span></label>
+      <input type="text" name="laird_ref">
+    </div>
+  </div>
+  <label>Date <span class="hint">on the invoice</span></label>
+  <input type="date" name="date" id="date_input">
+  <label>Notes <span class="hint">optional, internal only</span></label>
+  <textarea name="notes"></textarea>
+
+  <div class="section-title">Amounts (£)</div>
+  <div class="amounts">
+    <div><label>Labour</label><input type="number" name="labour" step="0.01" value="0.00"></div>
+    <div><label>Parts</label><input type="number" name="parts" step="0.01" value="0.00"></div>
+    <div><label>Paint &amp; Materials</label><input type="number" name="paint" step="0.01" value="0.00"></div>
+    <div><label>Specialist</label><input type="number" name="specialist" step="0.01" value="0.00"></div>
+  </div>
+
+  <div class="checkbox-row">
+    <input type="checkbox" name="vat_registered" id="vat" checked>
+    <label for="vat" style="margin: 0;">Apply 20% VAT</label>
+  </div>
+
+  <button type="submit">Create Job &amp; Generate Invoice</button>
+</form>
+<script>
+document.getElementById('date_input').valueAsDate = new Date();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route('/manual-invoice', methods=['GET', 'POST'])
+def manual_invoice():
+    if request.method == 'GET':
+        return MANUAL_INVOICE_FORM
+
+    try:
+        data = request.form.to_dict()
+
+        # Calculate figures
+        labour = float(data.get('labour') or 0)
+        parts = float(data.get('parts') or 0)
+        paint = float(data.get('paint') or 0)
+        specialist = float(data.get('specialist') or 0)
+        sub_total = labour + parts + paint + specialist
+        vat_registered = data.get('vat_registered') == 'on'
+        vat = round(sub_total * 0.20, 2) if vat_registered else 0.00
+        grand_total = round(sub_total + vat, 2)
+
+        # Date: YYYY-MM-DD from input -> DD/MM/YYYY for the invoice PDF
+        date_iso = data.get('date', '')
+        if date_iso and len(date_iso) == 10 and date_iso[4] == '-':
+            y, m, d = date_iso.split('-')
+            date_display = f'{d}/{m}/{y}'
+        else:
+            date_display = date_iso
+
+        reg = data.get('reg', '').upper().strip()
+        reg_clean = reg.replace(' ', '')
+
+        # 1. Get next invoice number from the Postgres sequence (atomic, shared with n8n)
+        invoice_number = get_next_invoice_number()
+        if not invoice_number:
+            return "<h1>Error</h1><p style='color:red'>Could not get next invoice number from Supabase. Check SUPABASE_URL / SUPABASE_KEY env vars and that the get_next_invoice_number() function exists in the database.</p><a href='/manual-invoice'>Back</a>", 500
+
+        # 2. Generate invoice PDF
+        invoice_data = {
+            'name': data.get('name', ''),
+            'address': data.get('address', ''),
+            'reg': reg,
+            'vehicle': data.get('vehicle', ''),
+            'invoice_number': invoice_number,
+            'acg_ref': data.get('acg_ref', ''),
+            'date': date_display,
+            'labour': f'{labour:.2f}',
+            'parts': f'{parts:.2f}',
+            'paint': f'{paint:.2f}',
+            'specialist': f'{specialist:.2f}',
+            'sub_total': f'{sub_total:.2f}',
+            'vat': f'{vat:.2f}',
+            'grand_total': f'{grand_total:.2f}',
+        }
+        pdf_bytes = generate_invoice(invoice_data)
+        filename = f"TRT_Invoice_{invoice_number}_{reg_clean}.pdf"
+
+        # 3. OneDrive + Outlook draft
+        onedrive_result = save_to_onedrive(pdf_bytes, filename, reg_clean)
+        outlook_result = save_to_outlook_draft(pdf_bytes, reg_clean, filename)
+
+        pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
+        onedrive_ok = onedrive_result.get('success', False)
+        outlook_ok = outlook_result.get('success', False)
+        onedrive_status = '✓ Saved to OneDrive' if onedrive_ok else f"✗ OneDrive: {onedrive_result.get('error', 'Failed')}"
+        outlook_status = '✓ Draft created in Outlook' if outlook_ok else f"✗ Outlook: {outlook_result.get('error', 'Failed')}"
+        onedrive_class = '' if onedrive_ok else 'fail'
+        outlook_class = '' if outlook_ok else 'fail'
+
+        return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<title>Invoice Generated</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; max-width: 760px; margin: 30px auto; padding: 20px; background: #f5f5f7; color: #333; }}
+.card {{ background: white; padding: 32px; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }}
+h1 {{ color: #1a1aff; margin-top: 0; }}
+.status {{ padding: 12px; margin: 10px 0; border-radius: 6px; background: #f0f7f0; border-left: 4px solid #2a8a2a; }}
+.status.fail {{ background: #fbf0f0; border-left-color: #c33; }}
+a.button {{ display: inline-block; background: #1a1aff; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; margin-top: 16px; margin-right: 8px; font-weight: 600; }}
+a.button.secondary {{ background: #666; }}
+.filename {{ font-family: monospace; background: #eef; padding: 8px 12px; border-radius: 4px; word-break: break-all; display: inline-block; }}
+.summary {{ background: #f9f9f9; padding: 16px; border-radius: 6px; margin: 16px 0; }}
+.summary div {{ display: flex; justify-content: space-between; padding: 4px 0; }}
+.summary .total {{ font-weight: bold; border-top: 1px solid #ccc; margin-top: 6px; padding-top: 10px; }}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Invoice {invoice_number}</h1>
+<p>File: <span class="filename">{filename}</span></p>
+<div class="summary">
+  <div><span>Labour</span><span>£{labour:.2f}</span></div>
+  <div><span>Parts</span><span>£{parts:.2f}</span></div>
+  <div><span>Paint &amp; Materials</span><span>£{paint:.2f}</span></div>
+  <div><span>Specialist</span><span>£{specialist:.2f}</span></div>
+  <div><span>Sub Total</span><span>£{sub_total:.2f}</span></div>
+  <div><span>VAT</span><span>£{vat:.2f}</span></div>
+  <div class="total"><span>Grand Total</span><span>£{grand_total:.2f}</span></div>
+</div>
+<div class="status {onedrive_class}">{onedrive_status}</div>
+<div class="status {outlook_class}">{outlook_status}</div>
+<a class="button" href="data:application/pdf;base64,{pdf_b64}" download="{filename}">Download PDF</a>
+<a class="button secondary" href="/manual-invoice">Create Another</a>
+</div>
+</body>
+</html>
+"""
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"<h1>Error</h1><p style='color:red'>{str(e)}</p><a href='/manual-invoice'>Back to form</a>", 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
