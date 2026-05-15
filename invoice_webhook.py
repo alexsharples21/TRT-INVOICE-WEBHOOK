@@ -45,7 +45,7 @@ def get_next_invoice_number():
     """Call the Supabase RPC get_next_invoice_number() — an atomic Postgres sequence call.
     Returns the next 5-digit zero-padded invoice number, or None on failure."""
     try:
-        r = supabase_request('POST', 'rpc/get_next_invoice_number')
+        r = supabase_request('POST', 'rpc/next_invoice_number')
         if r.status_code == 200:
             # RPC returns the bare string value
             result = r.json()
@@ -469,7 +469,7 @@ def manual_invoice():
         # 1. Get next invoice number from the Postgres sequence (atomic, shared with n8n)
         invoice_number = get_next_invoice_number()
         if not invoice_number:
-            return "<h1>Error</h1><p style='color:red'>Could not get next invoice number from Supabase. Check SUPABASE_URL / SUPABASE_KEY env vars and that the get_next_invoice_number() function exists in the database.</p><a href='/manual-invoice'>Back</a>", 500
+            return "<h1>Error</h1><p style='color:red'>Could not get next invoice number from Supabase. Check SUPABASE_URL / SUPABASE_KEY env vars and that the next_invoice_number() function exists in the database.</p><a href='/manual-invoice'>Back</a>", 500
 
         # 2. Generate invoice PDF
         invoice_data = {
