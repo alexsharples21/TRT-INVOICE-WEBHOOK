@@ -43,7 +43,8 @@ def supabase_request(method, path, **kwargs):
     return requests.request(method, url, headers=headers, **kwargs)
 
 def get_next_invoice_number():
-    """Call the Supabase RPC get_next_invoice_number() — an atomic Postgres sequence call.
+    """Call the Supabase RPC next_invoice_number() — now backed by invoice_number_seq, so
+    two invoices raised at the same moment can never share a number.
     Returns the next 5-digit zero-padded invoice number, or None on failure."""
     try:
         r = supabase_request('POST', 'rpc/next_invoice_number')
@@ -57,22 +58,126 @@ def get_next_invoice_number():
         print(f'Sequence RPC call failed: {e}')
     return None
 
-def upsert_job_for_invoice(data, invoice_number, figures):
-    """Create the job on the dashboard, or update it if an active job
-    with the same reg already exists. Returns a small status dict."""
+# ── Work providers and references ────────────────────────────────────────
+# jobs.scheme says who the job is for. Every outside reference lives in
+# job_references (one row each); the internal number is jobs.job_no (TRT-1042…).
+SCHEME_LABELS = {'acg': 'ACG', 'enterprise': 'Enterprise', 'blackthorn': 'Blackthorn',
+                 'nationwide': 'Nationwide', 'private': 'Private'}
+# which job_references row a "provider ref" typed on the manual form becomes, per scheme
+SCHEME_REF = {'acg': ('acg', 'case', 'ACG ref'), 'enterprise': ('enterprise', 'instruction', 'Enterprise ref'),
+              'blackthorn': ('blackthorn', 'rep', 'Blackthorn ref'), 'nationwide': ('nationwide', 'case', 'Nationwide ref'),
+              'private': ('insurer', 'claim', 'Claim ref')}
+
+def find_job(refs, reg):
+    """Resolve a job through the database's find_job(): any known provider ref
+    wins, otherwise a reg match on a recent job that is not Complete.
+    Returns the job row (dict) or None."""
+    refs = [str(r).strip() for r in (refs or []) if r and str(r).strip()]
+    try:
+        r = supabase_request('POST', 'rpc/find_job', json={'p_refs': refs, 'p_reg': (reg or '').strip() or None})
+        if r.status_code == 200:
+            rows = r.json()
+            return rows[0] if rows else None
+        print(f'find_job RPC returned {r.status_code}: {r.text[:200]}')
+    except Exception as e:
+        print(f'find_job RPC failed: {e}')
+    return None
+
+def add_job_reference(job_id, provider, ref_type, ref):
+    """Attach an outside reference to a job. Duplicates (same provider/type/ref,
+    already on any job) are ignored rather than failing the invoice."""
+    ref = (ref or '').strip()
+    if not job_id or not ref:
+        return
+    try:
+        supabase_request('POST', 'job_references?on_conflict=provider,ref_type,ref',
+                         json={'job_id': job_id, 'provider': provider, 'ref_type': ref_type, 'ref': ref},
+                         headers={'Prefer': 'resolution=ignore-duplicates,return=minimal'})
+    except Exception as e:
+        print(f'add_job_reference failed: {e}')
+
+def collect_refs(data):
+    """(provider, ref_type, label, value) for every reference present in a request."""
+    out = []
+    if data.get('acg_ref'):
+        out.append(('acg', 'case', 'ACG ref', data['acg_ref'].strip()))
+    if data.get('laird_ref'):
+        out.append(('laird', 'case', 'Laird ref', data['laird_ref'].strip()))
+    if data.get('provider_ref'):
+        prov, rtype, label = SCHEME_REF.get(data.get('scheme') or 'private', SCHEME_REF['private'])
+        out.append((prov, rtype, label, data['provider_ref'].strip()))
+    seen, deduped = set(), []
+    for item in out:
+        key = (item[0], item[1], item[3].upper())
+        if key not in seen:
+            seen.add(key); deduped.append(item)
+    return deduped
+
+NEEDS_INVOICING_STAGE = 5
+
+def ensure_job(data):
+    """Find the dashboard job this invoice belongs to, or create it. Returns a
+    small dict with id, job_no, scheme, action ('found' / 'created') — or an
+    error. Creating happens at "Needs invoicing"; mark_invoiced() moves it on
+    once the PDF exists, so a failed PDF never leaves a job marked invoiced."""
     try:
         reg = (data.get('reg') or '').upper().strip()
-        reg_clean = reg.replace(' ', '')
+        refs = collect_refs(data)
+        existing = find_job([v for (_, _, _, v) in refs], reg)
+        if existing and (existing.get('stage') or 0) >= COMPLETE_STAGE and not any(
+                (v or '').strip() for (_, _, _, v) in refs):
+            existing = None   # a completed job matched on reg alone: this is a new visit, not that job
+        if existing:
+            job_id = existing['id']
+            # refs typed on the form that the job does not have yet
+            for prov, rtype, _, val in refs:
+                add_job_reference(job_id, prov, rtype, val)
+            if data.get('scheme') and not existing.get('scheme'):
+                supabase_request('PATCH', f"jobs?id=eq.{job_id}", json={'scheme': data['scheme']})
+            return {'success': True, 'action': 'found', 'id': job_id,
+                    'job_no': existing.get('job_no'), 'scheme': existing.get('scheme') or data.get('scheme')}
         today = _date.today().isoformat()
-        existing = None
-        r = supabase_request('GET', 'jobs?select=id,reg,stage,stage_dates&order=added_date.desc&limit=500')
-        if r.status_code == 200:
-            for j in r.json():
-                if (j.get('reg') or '').replace(' ', '').upper() == reg_clean \
-                        and (j.get('stage') or 0) < COMPLETE_STAGE:
-                    existing = j
-                    break
-        money = {
+        payload = {
+            'name':    data.get('name', ''),
+            'reg':     reg,
+            'vehicle': data.get('vehicle', ''),
+            'address': data.get('address', ''),
+            'mobile':  data.get('mobile') or None,
+            'damage':  data.get('damage') or None,
+            'notes':   data.get('notes') or None,
+            'scheme':  data.get('scheme') or 'private',
+            # legacy columns stay populated until Phase 5 of the job-refs migration
+            'acg_ref':   data.get('acg_ref') or None,
+            'laird_ref': data.get('laird_ref') or None,
+            'stage': NEEDS_INVOICING_STAGE,
+            'stage_dates': {str(NEEDS_INVOICING_STAGE): today},
+            'auth_confirmed': True,
+            'added_date': today,
+        }
+        r = supabase_request('POST', 'jobs', json=payload)
+        if r.status_code not in (200, 201) or not r.json():
+            return {'success': False, 'error': f'{r.status_code}: {r.text[:200]}'}
+        job = r.json()[0]
+        for prov, rtype, _, val in refs:
+            add_job_reference(job['id'], prov, rtype, val)
+        return {'success': True, 'action': 'created', 'id': job['id'],
+                'job_no': job.get('job_no'), 'scheme': job.get('scheme')}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+def mark_invoiced(job, invoice_number, figures, data):
+    """Record the invoice against the job and move it to Invoiced."""
+    try:
+        today = _date.today().isoformat()
+        r = supabase_request('GET', f"jobs?id=eq.{job['id']}&select=stage_dates")
+        sd = (r.json()[0].get('stage_dates') if r.status_code == 200 and r.json() else None) or {}
+        if str(INVOICED_STAGE) not in sd:
+            sd[str(INVOICED_STAGE)] = today
+        payload = {
+            'invoice_number': invoice_number,
+            'stage': INVOICED_STAGE,
+            'stage_dates': sd,
+            'auth_confirmed': True,
             'labour_cost':        figures.get('labour', '0.00'),
             'parts_cost':         figures.get('parts', '0.00'),
             'paint_cost':         figures.get('paint', '0.00'),
@@ -81,51 +186,18 @@ def upsert_job_for_invoice(data, invoice_number, figures):
             'vat_total':          figures.get('vat', '0.00'),
             'repair_grand_total': figures.get('grand_total', '0.00'),
         }
-        if existing:
-            sd = existing.get('stage_dates') or {}
-            if str(INVOICED_STAGE) not in sd:
-                sd[str(INVOICED_STAGE)] = today
-            payload = {
-                'invoice_number': invoice_number,
-                'stage': INVOICED_STAGE,
-                'stage_dates': sd,
-                'auth_confirmed': True,
-                **money,
-            }
-            r = supabase_request('PATCH', f"jobs?id=eq.{existing['id']}", json=payload)
-            job_id, action = existing['id'], 'updated'
-        else:
-            payload = {
-                'name':    data.get('name', ''),
-                'reg':     reg,
-                'vehicle': data.get('vehicle', ''),
-                'address': data.get('address', ''),
-                'mobile':  data.get('mobile') or None,
-                'damage':  data.get('damage') or None,
-                'notes':   data.get('notes') or None,
-                'invoice_number': invoice_number,
-                'acg_ref':   data.get('acg_ref') or None,
-                'laird_ref': data.get('laird_ref') or None,
-                'stage': INVOICED_STAGE,
-                'stage_dates': {str(INVOICED_STAGE): today},
-                'auth_confirmed': True,
-                'added_date': today,
-                **money,
-            }
-            r = supabase_request('POST', 'jobs', json=payload)
-            job_id = (r.json()[0].get('id') if r.status_code in (200, 201) and r.json() else None)
-            action = 'created'
+        r = supabase_request('PATCH', f"jobs?id=eq.{job['id']}", json=payload)
         if r.status_code not in (200, 201, 204):
             return {'success': False, 'error': f'{r.status_code}: {r.text[:200]}'}
         supabase_request('POST', 'job_events', json={
-            'job_id': job_id,
-            'reg': reg,
+            'job_id': job['id'],
+            'reg': (data.get('reg') or '').upper().strip(),
             'name': data.get('name', ''),
             'event_type': 'invoice',
-            'message': f'Invoice {invoice_number} generated ({action} via manual invoice page)',
+            'message': f"{job.get('job_no') or ''} — invoice {invoice_number} generated ({job.get('action')} via manual invoice page)".strip(' —'),
             'auto': True,
         })
-        return {'success': True, 'action': action, 'job_id': job_id}
+        return {'success': True, 'action': job.get('action'), 'job_id': job['id'], 'job_no': job.get('job_no')}
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
@@ -253,6 +325,7 @@ def generate_invoice(data):
     vehicle     = data.get('vehicle', '').upper()
     inv_num     = data.get('invoice_number', 'TBC')
     acg_ref     = data.get('acg_ref', '')
+    job_no      = data.get('job_no') or ''
     date        = data.get('date', '')
     labour      = data.get('labour', '0.00')
     parts       = data.get('parts', '0.00')
@@ -313,8 +386,15 @@ def generate_invoice(data):
         c.drawString(left, y, line)
     y -= 6*mm
     c.drawString(left, y, f'Invoice Number {inv_num}')
-    y -= 5*mm
-    c.drawString(left, y, f'REF {acg_ref}')
+    if job_no:
+        y -= 5*mm
+        c.drawString(left, y, f'Our ref {job_no}')
+    ref_lines = [f'{label} {val}' for (_, _, label, val) in collect_refs(data)]
+    if not ref_lines and acg_ref:
+        ref_lines = [f'REF {acg_ref}']
+    for rl in ref_lines[:3]:
+        y -= 5*mm
+        c.drawString(left, y, rl)
     y -= 8*mm
     c.drawCentredString(W/2, y, f'{vehicle}  REG {reg}')
     y -= 10*mm
@@ -359,6 +439,16 @@ def generate_invoice(data):
     buffer.seek(0)
     return buffer.read()
 
+def invoice_filename(job_no, reg_clean, inv_num, suffix=''):
+    """TRT-1042_YG72TWW_INV03027.pdf — or the old TRT_Invoice_ form when no TRT number is known.
+    The reg stays in the name so the OneDrive dedupe (which matches on reg) still finds old files."""
+    if job_no:
+        return f"{job_no}_{reg_clean}_INV{inv_num}{suffix}.pdf"
+    return f"TRT_Invoice_{inv_num}_{reg_clean}{suffix}.pdf"
+
+def draft_subject_for(reg, job_no):
+    return f"{reg} - {job_no}" if job_no else reg
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
@@ -373,12 +463,19 @@ def extract_and_generate():
     }
     invoice_data = {**data, **figures}
     try:
-        pdf_bytes = generate_invoice(invoice_data)
         reg_clean = data.get('reg', '').replace(' ', '')
         inv_num = data.get('invoice_number', 'TBC')
-        filename = f"TRT_Invoice_{inv_num}_{reg_clean}.pdf"
+        # Until the n8n workflows send job_no themselves, look it up here so the
+        # PDF and filename carry the TRT number from day one.
+        if not invoice_data.get('job_no'):
+            job = find_job([data.get('acg_ref'), data.get('laird_ref')], data.get('reg', ''))
+            if job:
+                invoice_data['job_no'] = job.get('job_no')
+                invoice_data['scheme'] = invoice_data.get('scheme') or job.get('scheme')
+        pdf_bytes = generate_invoice(invoice_data)
+        filename = invoice_filename(invoice_data.get('job_no'), reg_clean, inv_num)
         onedrive_result = save_to_onedrive(pdf_bytes, filename, reg_clean)
-        outlook_result = save_to_outlook_draft(pdf_bytes, reg_clean, filename)
+        outlook_result = save_to_outlook_draft(pdf_bytes, draft_subject_for(reg_clean, invoice_data.get('job_no')), filename)
         return jsonify({
             'figures': figures,
             'pdf_base64': base64.b64encode(pdf_bytes).decode('utf-8'),
@@ -456,17 +553,25 @@ input[name=reg] { text-transform: uppercase; }
   </div>
   <label>Damage <span class="hint">optional</span></label>
   <textarea name="damage"></textarea>
-  <div class="section-title">References</div>
+  <div class="section-title">Work provider &amp; references</div>
   <div class="row">
     <div>
-      <label>ACG Ref <span class="hint">optional</span></label>
-      <input type="text" name="acg_ref">
+      <label>Work provider</label>
+      <select name="scheme" id="scheme_select" onchange="document.getElementById('provider_ref_label').textContent = this.options[this.selectedIndex].dataset.ref">
+        <option value="private" data-ref="Claim ref">Private / other</option>
+        <option value="acg" data-ref="ACG ref">ACG (Accident Credit Group)</option>
+        <option value="enterprise" data-ref="Enterprise ref (IGR number)">Enterprise (via IM Solutions)</option>
+        <option value="blackthorn" data-ref="Blackthorn ref (REP number)">Blackthorn</option>
+        <option value="nationwide" data-ref="Nationwide ref">Nationwide</option>
+      </select>
     </div>
     <div>
-      <label>Laird Ref <span class="hint">optional</span></label>
-      <input type="text" name="laird_ref">
+      <label><span id="provider_ref_label">Claim ref</span> <span class="hint">optional</span></label>
+      <input type="text" name="provider_ref">
     </div>
   </div>
+  <label>Laird Ref <span class="hint">optional</span></label>
+  <input type="text" name="laird_ref">
   <label>Date <span class="hint">on the invoice</span></label>
   <input type="date" name="date" id="date_input">
   <label>Notes <span class="hint">optional, internal only</span></label>
@@ -599,6 +704,20 @@ def manual_invoice():
 
         reg = data.get('reg', '').upper().strip()
         reg_clean = reg.replace(' ', '')
+        data['reg'] = reg
+        if data.get('scheme') == 'acg' and data.get('provider_ref') and not data.get('acg_ref'):
+            data['acg_ref'] = data['provider_ref']   # keeps the legacy column populated until Phase 5
+
+        # Dashboard job first (JOB invoices only), so the PDF can carry its TRT number
+        job = {'success': None}
+        if invoice_type == 'job':
+            job = ensure_job(data)
+            if not job.get('success'):
+                return f"<h1>Error</h1><p style='color:red'>Could not find or create the dashboard job: {job.get('error')}</p><a href='/manual-invoice'>Back</a>", 500
+        else:
+            found = find_job([v for (_, _, _, v) in collect_refs(data)], reg)
+            if found:
+                job = {'success': True, 'action': 'found', 'id': found['id'], 'job_no': found.get('job_no'), 'scheme': found.get('scheme')}
 
         invoice_number = get_next_invoice_number()
         if not invoice_number:
@@ -610,7 +729,11 @@ def manual_invoice():
             'reg': reg,
             'vehicle': data.get('vehicle', ''),
             'invoice_number': invoice_number,
+            'job_no': job.get('job_no') or '',
+            'scheme': data.get('scheme') or job.get('scheme') or 'private',
             'acg_ref': data.get('acg_ref', ''),
+            'laird_ref': data.get('laird_ref', ''),
+            'provider_ref': data.get('provider_ref', ''),
             'date': date_display,
             'line_items': line_items,
             'sub_total': f'{sub_total:.2f}',
@@ -619,22 +742,23 @@ def manual_invoice():
         }
         pdf_bytes = generate_invoice(invoice_data)
         type_suffix = {'job': '', 'storage': '_STORAGE', 'custom': '_CUSTOM'}.get(invoice_type, '')
-        filename = f"TRT_Invoice_{invoice_number}_{reg_clean}{type_suffix}.pdf"
+        filename = invoice_filename(job.get('job_no'), reg_clean, invoice_number, type_suffix)
 
         # OneDrive: only job invoices replace previous invoices for the reg —
         # a storage invoice must never delete the repair invoice
         onedrive_result = save_to_onedrive(pdf_bytes, filename, reg_clean if invoice_type == 'job' else '')
-        draft_subject = reg if invoice_type == 'job' else f"{reg} {'STORAGE' if invoice_type == 'storage' else 'INV'} {invoice_number}"
+        base_subject = draft_subject_for(reg, job.get('job_no'))
+        draft_subject = base_subject if invoice_type == 'job' else f"{base_subject} {'STORAGE' if invoice_type == 'storage' else 'INV'} {invoice_number}"
         outlook_result = save_to_outlook_draft(pdf_bytes, draft_subject, filename)
 
-        # Dashboard job: JOB invoices only
+        # Dashboard job: JOB invoices only — now that the PDF exists, record it and move to Invoiced
         job_result = {'success': None}
         if invoice_type == 'job':
-            job_result = upsert_job_for_invoice(data, invoice_number, {
+            job_result = mark_invoiced(job, invoice_number, {
                 'labour': f"{line_items[0]['amount']:.2f}", 'parts': f"{line_items[1]['amount']:.2f}",
                 'paint': f"{line_items[2]['amount']:.2f}", 'specialist': f"{line_items[3]['amount']:.2f}",
                 'sub_total': f'{sub_total:.2f}', 'vat': f'{vat:.2f}', 'grand_total': f'{grand_total:.2f}',
-            })
+            }, data)
 
         pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
         onedrive_ok = onedrive_result.get('success', False)
@@ -645,7 +769,7 @@ def manual_invoice():
         if invoice_type == 'job':
             ok = job_result.get('success', False)
             cls = '' if ok else 'fail'
-            txt = ('&#10003; Job ' + str(job_result.get('action', '')) + ' on dashboard') if ok \
+            txt = ('&#10003; Job ' + str(job_result.get('action', '')) + ' on dashboard as ' + str(job_result.get('job_no') or '')) if ok \
                   else ('&#10007; Dashboard: ' + str(job_result.get('error', '')))
             job_line = f'<div class="status {cls}">{txt}</div>'
         return f"""
@@ -670,7 +794,7 @@ a.button.secondary {{ background: #666; }}
 </head>
 <body>
 <div class="card">
-<h1>Invoice {invoice_number}</h1>
+<h1>Invoice {invoice_number}{(' — ' + job.get('job_no')) if job.get('job_no') else ''}</h1>
 <p>File: <span class="filename">{filename}</span></p>
 <div class="summary">
   {rows_html}
