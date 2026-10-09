@@ -457,10 +457,15 @@ def health():
 def extract_and_generate():
     data = request.json or {}
     pdf_base64 = data.get('pdf_base64', '')
-    figures = extract_pdf_figures(pdf_base64) if pdf_base64 else {
-        'labour': '0.00', 'parts': '0.00', 'paint': '0.00',
-        'specialist': '0.00', 'sub_total': '0.00', 'vat': '0.00', 'grand_total': '0.00'
-    }
+    # Phase 4 (Oct 2026): a workflow that has already read the authority (IMS/Enterprise
+    # authorities are parsed in n8n — their layout differs from Laird's) sends the
+    # figures ready-made; only Laird authority PDFs are parsed here.
+    figures = data.get('figures') if isinstance(data.get('figures'), dict) else None
+    if not figures:
+        figures = extract_pdf_figures(pdf_base64) if pdf_base64 else {
+            'labour': '0.00', 'parts': '0.00', 'paint': '0.00',
+            'specialist': '0.00', 'sub_total': '0.00', 'vat': '0.00', 'grand_total': '0.00'
+        }
     invoice_data = {**data, **figures}
     try:
         reg_clean = data.get('reg', '').replace(' ', '')
@@ -616,8 +621,7 @@ input[name=reg] { text-transform: uppercase; }
   </div>
 
   <div class="checkbox-row">
-    <input type="checkbox" name="vat_registered" id="vat" checked>
-    <label for="vat" style="margin: 0;">Apply 20% VAT</label>
+    <label style="margin: 0; color: #555;">20% VAT is added to every invoice (whether or not the customer is VAT registered).</label>
   </div>
   <button type="submit">Generate Invoice</button>
 </form>
@@ -691,8 +695,9 @@ def manual_invoice():
                 return "<h1>Error</h1><p style='color:red'>Add at least one line with a description and amount.</p><a href='/manual-invoice'>Back</a>", 400
 
         sub_total = round(sum(li['amount'] for li in line_items), 2)
-        vat_registered = data.get('vat_registered') == 'on'
-        vat = round(sub_total * 0.20, 2) if vat_registered else 0.00
+        # VAT is always charged at 20%, whatever the customer's VAT status (Alex, 9 Oct 2026).
+        # The old "Apply 20% VAT" tick box is gone; a stray vat_registered field is ignored.
+        vat = round(sub_total * 0.20, 2)
         grand_total = round(sub_total + vat, 2)
 
         date_iso = data.get('date', '')
