@@ -64,7 +64,7 @@ def get_next_invoice_number():
 SCHEME_LABELS = {'acg': 'ACG', 'enterprise': 'Enterprise', 'blackthorn': 'Blackthorn',
                  'nationwide': 'Nationwide', 'private': 'Private'}
 # which job_references row a "provider ref" typed on the manual form becomes, per scheme
-SCHEME_REF = {'acg': ('acg', 'case', 'ACG ref'), 'enterprise': ('enterprise', 'instruction', 'Enterprise ref'),
+SCHEME_REF = {'acg': ('acg', 'case', 'ACG ref'), 'enterprise': ('ims', 'instruction', 'Enterprise ref'),
               'blackthorn': ('blackthorn', 'rep', 'Blackthorn ref'), 'nationwide': ('nationwide', 'case', 'Nationwide ref'),
               'private': ('insurer', 'claim', 'Claim ref')}
 
@@ -106,6 +106,8 @@ def collect_refs(data):
     if data.get('provider_ref'):
         prov, rtype, label = SCHEME_REF.get(data.get('scheme') or 'private', SCHEME_REF['private'])
         out.append((prov, rtype, label, data['provider_ref'].strip()))
+    if data.get('ims_case'):
+        out.append(('ims', 'case', 'IMS case', str(data['ims_case']).strip()))
     seen, deduped = set(), []
     for item in out:
         key = (item[0], item[1], item[3].upper())
@@ -318,9 +320,17 @@ def extract_pdf_figures(pdf_base64):
         'raw_text':   text[:300]
     }
 
+# Enterprise Rent-A-Car jobs (scheme 'enterprise', instructed through IMS) are billed to Enterprise,
+# not to the driver — IMS reject anything else. Address exactly as IMS gave it when they rejected
+# invoice 03000 / DF69UNB on 16 Sep 2026 (and as Alex confirmed, 10 Oct 2026).
+ENTERPRISE_BILL_TO = ['Enterprise Rent-A-Car', 'Enterprise House', 'Melbourne Park', 'Vicarage Road',
+                      'Egham', 'Surrey', 'TW20 9FB']
+
 def generate_invoice(data):
     name        = data.get('name', '')
     address     = data.get('address', '')
+    scheme      = (data.get('scheme') or '').strip().lower()
+    bill_enterprise = scheme == 'enterprise'
     reg         = data.get('reg', '')
     vehicle     = data.get('vehicle', '').upper()
     inv_num     = data.get('invoice_number', 'TBC')
@@ -334,7 +344,10 @@ def generate_invoice(data):
     sub_total   = data.get('sub_total', '0.00')
     vat         = data.get('vat', '0.00')
     grand_total = data.get('grand_total', '0.00')
-    addr_lines = [l.strip() for l in address.split(',') if l.strip()]
+    if bill_enterprise:
+        bill_name, addr_lines = ENTERPRISE_BILL_TO[0], ENTERPRISE_BILL_TO[1:]
+    else:
+        bill_name, addr_lines = name, [l.strip() for l in address.split(',') if l.strip()]
     # Build the table: custom line items (storage/recovery/custom invoices)
     # or the standard job breakdown.
     line_items = data.get('line_items')
@@ -379,7 +392,7 @@ def generate_invoice(data):
     left, right = 25*mm, W - 25*mm
     c.setFont('Helvetica', 10)
     c.setFillColor(colors.black)
-    c.drawString(left, y, name)
+    c.drawString(left, y, bill_name)
     c.drawRightString(right, y, date)
     for line in addr_lines:
         y -= 5*mm
@@ -397,6 +410,9 @@ def generate_invoice(data):
         c.drawString(left, y, rl)
     y -= 8*mm
     c.drawCentredString(W/2, y, f'{vehicle}  REG {reg}')
+    if bill_enterprise and name:
+        y -= 5*mm
+        c.drawCentredString(W/2, y, f'Customer: {name}')   # the driver still appears, below the vehicle
     y -= 10*mm
     col_w = [110*mm, 50*mm]
     tbl = Table(table_data, colWidths=col_w, rowHeights=7*mm)
