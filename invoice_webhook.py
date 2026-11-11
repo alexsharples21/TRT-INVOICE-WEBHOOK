@@ -196,7 +196,9 @@ def mark_invoiced(job, invoice_number, figures, data):
             'reg': (data.get('reg') or '').upper().strip(),
             'name': data.get('name', ''),
             'event_type': 'invoice',
-            'message': f"{job.get('job_no') or ''} — invoice {invoice_number} generated ({job.get('action')} via manual invoice page)".strip(' —'),
+            'message': (f"{job.get('job_no') or ''} — invoice {invoice_number} generated ({job.get('action')} via manual invoice page)"
+                        + (f" · less excess £{float(figures.get('excess') or 0):.2f}" if float(figures.get('excess') or 0) > 0 else '')
+                        + (' · no VAT' if figures.get('vat_applied') is False else '')).strip(' —'),
             'auto': True,
         })
         return {'success': True, 'action': job.get('action'), 'job_id': job['id'], 'job_no': job.get('job_no')}
@@ -344,6 +346,12 @@ def generate_invoice(data):
     sub_total   = data.get('sub_total', '0.00')
     vat         = data.get('vat', '0.00')
     grand_total = data.get('grand_total', '0.00')
+    # Excess (manual invoices only): a customer-paid amount deducted after VAT.
+    # Automated workflows never send it, so their invoices are unchanged.
+    try:
+        excess = round(float(data.get('excess') or 0), 2)
+    except (TypeError, ValueError):
+        excess = 0.0
     if bill_enterprise:
         bill_name, addr_lines = ENTERPRISE_BILL_TO[0], ENTERPRISE_BILL_TO[1:]
     else:
@@ -351,24 +359,20 @@ def generate_invoice(data):
     # Build the table: custom line items (storage/recovery/custom invoices)
     # or the standard job breakdown.
     line_items = data.get('line_items')
+    totals_rows = [['SUB TOTAL', fmt(sub_total)], ['VAT', fmt(vat)]]
+    if excess > 0:
+        totals_rows.append(['LESS EXCESS', f'-{fmt(excess)}'])
+    totals_rows.append(['GRAND TOTAL', fmt(grand_total)])
     if line_items:
-        table_data = [[li['label'], fmt(li['amount'])] for li in line_items]
-        table_data += [
-            ['SUB TOTAL',   fmt(sub_total)],
-            ['VAT',         fmt(vat)],
-            ['GRAND TOTAL', fmt(grand_total)],
-        ]
+        table_data = [[li['label'], fmt(li['amount'])] for li in line_items] + totals_rows
     else:
         table_data = [
             ['LABOUR',              fmt(labour)],
             ['PARTS',               fmt(parts)],
             ['PAINT AND MATERIALS', fmt(paint)],
             ['SPECIALIST',          fmt(specialist)],
-            ['SUB TOTAL',           fmt(sub_total)],
-            ['VAT',                 fmt(vat)],
-            ['GRAND TOTAL',         fmt(grand_total)],
-        ]
-    totals_start = len(table_data) - 3
+        ] + totals_rows
+    totals_start = len(table_data) - len(totals_rows)
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     c.setFont('Helvetica', 7.5)
@@ -636,9 +640,14 @@ input[name=reg] { text-transform: uppercase; }
     <button type="button" class="add-line" onclick="addLine()">+ Add another line</button>
   </div>
 
+  <div class="section-title">VAT &amp; Excess</div>
   <div class="checkbox-row">
-    <label style="margin: 0; color: #555;">20% VAT is added to every invoice (whether or not the customer is VAT registered).</label>
+    <input type="checkbox" name="add_vat" id="add_vat" value="1" checked oninput="calcTotals()">
+    <label for="add_vat" style="margin: 0;">Add 20% VAT <span class="hint">on by default &mdash; untick only for a no-VAT invoice</span></label>
   </div>
+  <label>Excess (&pound;) <span class="hint">optional &mdash; paid by the customer, deducted from the grand total after VAT</span></label>
+  <input type="number" name="excess" id="excess" step="0.01" min="0" value="0.00" oninput="calcTotals()">
+  <div class="calc-box" id="totals-calc">Sub total &pound;0.00 &nbsp;|&nbsp; VAT &pound;0.00 &nbsp;|&nbsp; Grand total &pound;0.00</div>
   <button type="submit">Generate Invoice</button>
 </form>
 <script>
@@ -648,7 +657,35 @@ function showType() {
   document.getElementById('job-section').style.display = (t === 'job') ? 'block' : 'none';
   document.getElementById('storage-section').style.display = (t === 'storage') ? 'block' : 'none';
   document.getElementById('custom-section').style.display = (t === 'custom') ? 'block' : 'none';
+  calcTotals();
 }
+function num(id) { var el = document.getElementById(id); return el ? (parseFloat(el.value) || 0) : 0; }
+function subTotal() {
+  var t = document.querySelector('input[name=invoice_type]:checked').value;
+  if (t === 'job') {
+    var s = 0;
+    document.querySelectorAll('#job-section input[type=number]').forEach(function (i) { s += parseFloat(i.value) || 0; });
+    return s;
+  }
+  if (t === 'storage') {
+    return num('rc') + (parseInt(document.getElementById('sd').value) || 0) * num('sr');
+  }
+  var c = 0;
+  document.querySelectorAll('#custom-lines input.amt').forEach(function (i) { c += parseFloat(i.value) || 0; });
+  return c;
+}
+function calcTotals() {
+  var sub = subTotal();
+  var vat = document.getElementById('add_vat').checked ? Math.round(sub * 20) / 100 : 0;
+  var ex  = num('excess');
+  var grand = sub + vat - ex;
+  var box = document.getElementById('totals-calc');
+  box.innerHTML = 'Sub total &pound;' + sub.toFixed(2) + ' &nbsp;|&nbsp; VAT &pound;' + vat.toFixed(2) +
+    (ex > 0 ? ' &nbsp;|&nbsp; Less excess &pound;' + ex.toFixed(2) : '') +
+    ' &nbsp;|&nbsp; Grand total &pound;' + grand.toFixed(2);
+  box.style.color = grand < 0 ? '#c33' : '#1a1aff';
+}
+document.querySelector('form').addEventListener('input', calcTotals);
 function calcStorage() {
   var rc = parseFloat(document.getElementById('rc').value) || 0;
   var d  = parseInt(document.getElementById('sd').value) || 0;
@@ -657,6 +694,7 @@ function calcStorage() {
   document.getElementById('storage-calc').innerHTML =
     'Storage: ' + d + ' days &times; &pound;' + r.toFixed(2) + ' = &pound;' + st.toFixed(2) +
     ' &nbsp;|&nbsp; Total before VAT: &pound;' + (rc + st).toFixed(2);
+  calcTotals();
 }
 function addLine() {
   var div = document.createElement('div');
@@ -711,10 +749,21 @@ def manual_invoice():
                 return "<h1>Error</h1><p style='color:red'>Add at least one line with a description and amount.</p><a href='/manual-invoice'>Back</a>", 400
 
         sub_total = round(sum(li['amount'] for li in line_items), 2)
-        # VAT is always charged at 20%, whatever the customer's VAT status (Alex, 9 Oct 2026).
-        # The old "Apply 20% VAT" tick box is gone; a stray vat_registered field is ignored.
-        vat = round(sub_total * 0.20, 2)
-        grand_total = round(sub_total + vat, 2)
+        # VAT: 20% by default on every manual invoice (whatever the customer's VAT status),
+        # but the "Add 20% VAT" box can be unticked for a no-VAT invoice (Alex, 11 Nov 2026).
+        # Automated invoices (/extract-and-generate) are unaffected and always carry VAT.
+        vat_applied = data.get('add_vat') == '1'
+        vat = round(sub_total * 0.20, 2) if vat_applied else 0.00
+        # Excess: a customer-paid amount deducted after VAT, so £2,000 + £400 VAT - £250 = £2,150.
+        try:
+            excess = round(float(data.get('excess') or 0), 2)
+        except ValueError:
+            excess = 0.0
+        if excess < 0:
+            return "<h1>Error</h1><p style='color:red'>Excess can't be negative.</p><a href='/manual-invoice'>Back</a>", 400
+        grand_total = round(sub_total + vat - excess, 2)
+        if grand_total < 0:
+            return f"<h1>Error</h1><p style='color:red'>Excess £{excess:.2f} is more than the invoice total £{sub_total + vat:.2f}.</p><a href='/manual-invoice'>Back</a>", 400
 
         date_iso = data.get('date', '')
         if date_iso and len(date_iso) == 10 and date_iso[4] == '-':
@@ -759,6 +808,7 @@ def manual_invoice():
             'line_items': line_items,
             'sub_total': f'{sub_total:.2f}',
             'vat': f'{vat:.2f}',
+            'excess': f'{excess:.2f}',
             'grand_total': f'{grand_total:.2f}',
         }
         pdf_bytes = generate_invoice(invoice_data)
@@ -779,6 +829,7 @@ def manual_invoice():
                 'labour': f"{line_items[0]['amount']:.2f}", 'parts': f"{line_items[1]['amount']:.2f}",
                 'paint': f"{line_items[2]['amount']:.2f}", 'specialist': f"{line_items[3]['amount']:.2f}",
                 'sub_total': f'{sub_total:.2f}', 'vat': f'{vat:.2f}', 'grand_total': f'{grand_total:.2f}',
+                'excess': f'{excess:.2f}', 'vat_applied': vat_applied,
             }, data)
 
         pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
@@ -820,7 +871,8 @@ a.button.secondary {{ background: #666; }}
 <div class="summary">
   {rows_html}
   <div><span>Sub Total</span><span>£{sub_total:.2f}</span></div>
-  <div><span>VAT</span><span>£{vat:.2f}</span></div>
+  <div><span>VAT{'' if vat_applied else ' (not applied)'}</span><span>£{vat:.2f}</span></div>
+  {f'<div><span>Less excess</span><span>-£{excess:.2f}</span></div>' if excess > 0 else ''}
   <div class="total"><span>Grand Total</span><span>£{grand_total:.2f}</span></div>
 </div>
 <div class="status {'' if onedrive_ok else 'fail'}">{'&#10003; Saved to OneDrive' if onedrive_ok else '&#10007; OneDrive: ' + str(onedrive_result.get('error', 'Failed'))}</div>
