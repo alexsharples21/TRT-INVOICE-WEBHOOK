@@ -197,6 +197,7 @@ def mark_invoiced(job, invoice_number, figures, data):
             'name': data.get('name', ''),
             'event_type': 'invoice',
             'message': (f"{job.get('job_no') or ''} — invoice {invoice_number} generated ({job.get('action')} via manual invoice page)"
+                        + (f" · {figures.get('other_desc') or 'OTHER'} £{float(figures.get('other') or 0):.2f}" if float(figures.get('other') or 0) > 0 else '')
                         + (f" · less excess £{float(figures.get('excess') or 0):.2f}" if float(figures.get('excess') or 0) > 0 else '')
                         + (' · no VAT' if figures.get('vat_applied') is False else '')).strip(' —'),
             'auto': True,
@@ -609,6 +610,8 @@ input[name=reg] { text-transform: uppercase; }
       <div><label>Parts</label><input type="number" name="parts" step="0.01" value="0.00"></div>
       <div><label>Paint &amp; Materials</label><input type="number" name="paint" step="0.01" value="0.00"></div>
       <div><label>Specialist</label><input type="number" name="specialist" step="0.01" value="0.00"></div>
+      <div><label>Other <span class="hint">description, optional</span></label><input type="text" name="other_desc" placeholder="e.g. Recovery, Diagnostics"></div>
+      <div><label>Other (&pound;)</label><input type="number" name="other" step="0.01" value="0.00"></div>
     </div>
   </div>
 
@@ -722,12 +725,17 @@ def manual_invoice():
             parts = float(data.get('parts') or 0)
             paint = float(data.get('paint') or 0)
             specialist = float(data.get('specialist') or 0)
+            other = float(data.get('other') or 0)
+            other_desc = (data.get('other_desc') or '').strip().upper()
             line_items = [
                 {'label': 'LABOUR',              'amount': labour},
                 {'label': 'PARTS',               'amount': parts},
                 {'label': 'PAINT AND MATERIALS', 'amount': paint},
                 {'label': 'SPECIALIST',          'amount': specialist},
             ]
+            # OTHER sits after Specialist and before the totals; only printed when used
+            if other or other_desc:
+                line_items.append({'label': f'OTHER - {other_desc}' if other_desc else 'OTHER', 'amount': other})
         elif invoice_type == 'storage':
             recovery_charge = float(data.get('recovery_charge') or 0)
             storage_days = int(float(data.get('storage_days') or 0))
@@ -830,6 +838,8 @@ def manual_invoice():
                 'paint': f"{line_items[2]['amount']:.2f}", 'specialist': f"{line_items[3]['amount']:.2f}",
                 'sub_total': f'{sub_total:.2f}', 'vat': f'{vat:.2f}', 'grand_total': f'{grand_total:.2f}',
                 'excess': f'{excess:.2f}', 'vat_applied': vat_applied,
+                'other': f"{line_items[4]['amount']:.2f}" if len(line_items) > 4 else '0.00',
+                'other_desc': line_items[4]['label'] if len(line_items) > 4 else '',
             }, data)
 
         pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
